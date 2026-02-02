@@ -1,103 +1,146 @@
-
 import { NextResponse } from 'next/server';
+
+interface Contact {
+  name: string;
+  tel: string;
+}
+
+// Fallback contacts (if device contacts not available)
+const FALLBACK_CONTACTS: Record<string, string> = {
+  "doctor": "102",
+  "daktar": "102",
+  "डॉक्टर": "102",
+  "police": "100",
+  "ambulance": "102"
+};
+
+// Scam keywords
+const SCAM_WORDS = ["lottery", "winner", "prize", "otp", "kyc", "password", "pin"];
 
 export async function POST(request: Request) {
   try {
-    const { text } = await request.json();
-    console.log("Received text:", text);
-
-    // Simple mocked AI for Hackathon Demo
-    // In a real app, you'd call OpenAI/Gemini here.
+    const { text, contacts } = await request.json();
+    console.log("\n━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log("📥 RECEIVED:", text);
+    console.log("📇 User contacts:", contacts?.length || 0);
     
-    // Normalize text
-    const lowerText = text.toLowerCase();
+    const lower = text.toLowerCase().trim();
+    const normalized = lower.replace(/\s+/g, '');
     
-    // Default values
-    let recipient = "Merchant"; 
-    let amount = "500";
-    let intent = "payment";
+    console.log("🔍 LOWERCASE:", lower);
 
-    // 1. Extract Amount (Find the first number in the text)
-    const amountMatch = lowerText.match(/(\d+)/);
-    if (amountMatch) {
-      amount = amountMatch[1];
+    // 1. SCAM CHECK
+    for (const word of SCAM_WORDS) {
+      if (lower.includes(word)) {
+        console.log("⚠️ SCAM DETECTED!");
+        return NextResponse.json({
+          intent: 'scam',
+          details: {},
+          warning: `खतरा! Yeh scam lag raha hai. Kabhi bhi ${word} share mat karein.`,
+          originalText: text
+        });
+      }
     }
 
-    // 2. Extract Recipient Name
-    // Strategy A: Look for "ko" (Hindi: "Raju ko...")
-    if (lowerText.includes(" ko ")) {
-      const parts = lowerText.split(" ko ");
-      // The name is usually immediately before "ko"
-      // e.g. "raju ko" -> "raju"
-      // e.g. "mere bhai amit ko" -> "mere bhai amit"
-      // We'll take the text before 'ko' and clean it up.
-      let rawName = parts[0].trim();
+    // 2. SMART CONTACT MATCHING
+    // Combine user contacts with fallback contacts
+    const allContacts: Contact[] = [
+      ...(contacts || []),
+      ...Object.entries(FALLBACK_CONTACTS).map(([name, tel]) => ({ name, tel }))
+    ];
+
+    console.log("🔍 Checking in", allContacts.length, "total contacts");
+
+    // Check for contact names
+    for (const contact of allContacts) {
+      const contactName = contact.name.toLowerCase();
       
-      // Cleanup: Remove common start words if they exist (optional)
-      // But purely taking everything before 'ko' is safest for full names.
-      // We just need to remove the amount if the user said "500 rupees raju ko" (rare but possible)
-      // If the amount is in the name string, remove it.
-      if (amountMatch && rawName.includes(amountMatch[0])) {
-         rawName = rawName.replace(amountMatch[0], "").trim();
-      }
-      // Remove "rupees", "rupaye" from name if present
-      rawName = rawName.replace(/(rupees|rupaye|rs|bhejo|send|pay|paise|money|transfer|karo)/g, "").trim();
-      
-      if (rawName.length > 0) {
-        recipient = rawName;
-      }
-    }
-    // Strategy B: Look for "to" (English: "pay to Raju...")
-    else if (lowerText.includes("to ")) {
-      const parts = lowerText.split("to ");
-      if (parts.length > 1) {
-         let rawName = parts[1].trim();
-         // The name is after "to". 
-         // "to raju" -> "raju"
-         // "to raju please" -> "raju please"
-         // We should stop at the end of the sentence or before amount if mentioned after
-         
-         if (amountMatch && rawName.includes(amountMatch[0])) {
-             rawName = rawName.replace(amountMatch[0], "").trim();
-         }
-         rawName = rawName.replace(/(rupees|rupaye|rs|please)/g, "").trim();
-         
-         if (rawName.length > 0) {
-            recipient = rawName;
-         }
-      }
-    }
-    // Strategy C: Fallback if no "to" or "ko"
-    else {
-        // If we have a number, assume the rest is the name?
-        // "pay raju 500"
-        let tempName = lowerText.replace(amount, "").replace(/(pay|send|rupees|rupaye|rs|bhejo)/g, "").trim();
-        if (tempName.length > 0 && tempName.length < 20) {
-            recipient = tempName;
+      // Fuzzy matching - check if spoken text contains contact name
+      if (lower.includes(contactName) || normalized.includes(contactName.replace(/\s+/g, ''))) {
+        console.log(`   ✅ MATCHED: "${contactName}" → ${contact.tel}`);
+        
+        // Check if there's a number (could be payment)
+        const hasNumber = /\d+/.test(lower);
+        
+        if (!hasNumber) {
+          // No number = definitely a call
+          console.log("   📞 No number, treating as CALL");
+          return NextResponse.json({
+            intent: 'call',
+            details: {
+              recipient: contact.name.charAt(0).toUpperCase() + contact.name.slice(1),
+              number: contact.tel
+            },
+            originalText: text
+          });
+        } else {
+          // Has number - check for call keywords
+          const callKeywords = [
+            "call", "kol", "lagao", "phone", "fone", "baat", 
+            "कॉल", "लगाओ", "फोन", "बात"
+          ];
+          const hasCallKeyword = callKeywords.some(kw => lower.includes(kw));
+          
+          if (hasCallKeyword) {
+            console.log("   📞 Has call keyword, treating as CALL");
+            return NextResponse.json({
+              intent: 'call',
+              details: {
+                recipient: contact.name.charAt(0).toUpperCase() + contact.name.slice(1),
+                number: contact.tel
+              },
+              originalText: text
+            });
+          }
         }
+      }
     }
 
-    // Capitalize recipient
-    recipient = recipient.charAt(0).toUpperCase() + recipient.slice(1);
+    // 3. PAYMENT INTENT
+    const numberMatch = lower.match(/(\d+)/);
+    if (numberMatch) {
+      const amount = numberMatch[0];
+      console.log("💰 PAYMENT INTENT - Amount:", amount);
+      
+      // Extract recipient name
+      let name = lower
+        .replace(amount, " ")
+        .replace(/(pay|send|rupees|rupaye|rs|bhejo|to|ko|de|do|karo)/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      
+      if (!name || name.length < 2) name = "merchant";
+      
+      console.log("✅ RECIPIENT:", name);
+      
+      const recipientName = name.charAt(0).toUpperCase() + name.slice(1);
+      const upiLink = `upi://pay?pa=demo@upi&pn=${encodeURIComponent(recipientName)}&am=${amount}&cu=INR`;
+      
+      return NextResponse.json({
+        intent: 'pay',
+        details: {
+          amount,
+          recipient: recipientName,
+          upiLink
+        },
+        originalText: text
+      });
+    }
 
-    // Generate Deep Link
-    // upi://pay?pa=merchant@upi&pn=Raju&am=500&cu=INR
-    // For demo, we assume a generic merchant VPA or use the name as part of it mockingly.
-    // In real UPI, pa needs to be a valid VPA.
-    // We will use a placeholder VPA for the hackathon demo unless specified.
-    const vpa = "merchant@upi"; 
-    const upiLink = `upi://pay?pa=${vpa}&pn=${recipient}&am=${amount}&cu=INR`;
-
+    // 4. UNKNOWN
+    console.log("❓ UNKNOWN COMMAND");
+    const availableNames = allContacts.slice(0, 5).map(c => c.name).join(", ");
     return NextResponse.json({
-      intent,
-      recipient,
-      amount,
-      upiLink,
+      intent: 'unknown',
+      details: {},
+      warning: contacts?.length > 0 
+        ? `Samajh nahi aaya. Aapke contacts mein se kisi ko call karein ya payment bhejein.`
+        : `Samajh nahi aaya. Pehle 'Load Contacts' button dabayein ya boliye 'Doctor ko call karo'`,
       originalText: text
     });
 
   } catch (error) {
-    console.error("Error processing text:", error);
-    return NextResponse.json({ error: "Failed to process voice command" }, { status: 500 });
+    console.error("💥 ERROR:", error);
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
 }

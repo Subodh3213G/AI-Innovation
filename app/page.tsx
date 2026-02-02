@@ -1,400 +1,437 @@
-
 /* eslint-disable @typescript-eslint/no-explicit-any */
 'use client';
 
-
 import { useState, useEffect, useRef } from 'react';
-import { Mic, Check, Loader2, ShieldCheck, ArrowRight, RefreshCcw, Phone, AlertTriangle } from 'lucide-react';
+import { Mic, AlertTriangle, Phone, Check, Loader2, X, Users } from 'lucide-react';
 
-// Type definitions for Web Speech API
+// Types
 interface IWindow extends Window {
   webkitSpeechRecognition: any;
   SpeechRecognition: any;
 }
 
+type Status = 'idle' | 'listening' | 'processing' | 'verifying' | 'scam' | 'completed';
+type Intent = 'pay' | 'call' | 'scam' | 'unknown';
+
+interface Result {
+  intent: Intent;
+  details: {
+    amount?: string;
+    recipient?: string;
+    number?: string;
+    upiLink?: string;
+  };
+  warning?: string;
+  originalText: string;
+}
+
+interface Contact {
+  name: string;
+  tel: string;
+}
+
 export default function Home() {
-  const [status, setStatus] = useState<'idle' | 'listening' | 'processing' | 'verifying' | 'completed'>('idle');
-  const [transcript, setTranscript] = useState('');
-  const [result, setResult] = useState<{ recipient: string; amount: string; upiLink: string } | null>(null);
+  const [status, setStatus] = useState<Status>('idle');
+  const [result, setResult] = useState<Result | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [transcript, setTranscript] = useState('');
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [hasContactPermission, setHasContactPermission] = useState(false);
   
   const recognitionRef = useRef<any>(null);
-  const [interimText, setInterimText] = useState('');
-  const watchdogRef = useRef<NodeJS.Timeout | null>(null);
-  const transcriptRef = useRef('');
 
-  const requestMicrophoneAccess = async () => {
-    try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      return true;
-    } catch (err) {
-      console.error("Microphone permission denied:", err);
-      setError("Microphone permission denied. Check your browser settings.");
-      return false;
-    }
-  };
-
-  const startListening = async () => {
-    // Explicitly request permission first
-    const hasPermission = await requestMicrophoneAccess();
-    if (!hasPermission) return;
-
-    if (recognitionRef.current) {
-      try {
-        setInterimText('');
-        transcriptRef.current = ''; // Reset ref
-        setError(null);
-        recognitionRef.current.start();
-        
-        // Safety: Mobile browsers sometimes hang. Force stop after 8 seconds if no result.
-        if (watchdogRef.current) clearTimeout(watchdogRef.current);
-        watchdogRef.current = setTimeout(() => {
-            stopListening(); 
-        }, 8000);
-        
-      } catch (e) {
-        console.error(e);
-        try { recognitionRef.current.stop(); } catch(err) { /* ignore */ }
-      }
-    } else {
-      alert("Speech recognition not supported in this browser.");
-    }
-  };
-
-  const stopListening = () => {
-    if (recognitionRef.current) {
-        recognitionRef.current.stop();
-    }
-    if (watchdogRef.current) clearTimeout(watchdogRef.current);
-    // The actual state change happens in onend
-  };
-
-  const processCommand = async (text: string) => {
-    if (!text || text.trim().length === 0) return;
-
-    // 1. Lock UI immediately
-    setStatus('processing');
-    if (watchdogRef.current) clearTimeout(watchdogRef.current);
-    
-    try {
-      const response = await fetch('/api/process', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      });
-
-      if (!response.ok) throw new Error("Failed to process");
-
-      const data = await response.json();
-      setResult(data);
-      setStatus('verifying');
-      
-      // Voice Verification
-      speakVerification(data.recipient, data.amount);
-
-    } catch (err) {
-      console.error(err);
-      setError("Something went wrong. Please try again.");
-      setStatus('idle');
-    }
-  };
-
+  // Check if Contact Picker API is supported
   useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const { webkitSpeechRecognition, SpeechRecognition } = window as unknown as IWindow;
-      const SpeechRecognitionConstructor = SpeechRecognition || webkitSpeechRecognition;
-      
-      if (SpeechRecognitionConstructor) {
-        recognitionRef.current = new SpeechRecognitionConstructor();
-        recognitionRef.current.continuous = false; // Mobile: often better as false
-        recognitionRef.current.interimResults = true;
-        recognitionRef.current.lang = 'hi-IN'; 
-
-        recognitionRef.current.onstart = () => {
-          setStatus('listening');
-          setError(null);
-        };
-
-        recognitionRef.current.onresult = (event: any) => {
-           if (watchdogRef.current) clearTimeout(watchdogRef.current);
-           
-           let finalTranscript = '';
-           let interimTranscript = '';
-
-           for (let i = event.resultIndex; i < event.results.length; ++i) {
-              if (event.results[i].isFinal) {
-                finalTranscript += event.results[i][0].transcript;
-              } else {
-                interimTranscript += event.results[i][0].transcript;
-              }
-           }
-           
-           // Update UI
-           setInterimText(finalTranscript || interimTranscript);
-           
-           // Update Ref for safety
-           const currentBestText = finalTranscript || interimTranscript;
-           if (currentBestText) {
-               transcriptRef.current = currentBestText;
-           }
-
-           // If we got a final result, we can try to process immediately, 
-           // BUT on mobile sometimes it's safer to wait for onend or user stop 
-           // to avoid cutting them off. 
-           // However, for "One Shot" commands like this, immediate processing on final is good.
-           if (finalTranscript) {
-               processCommand(finalTranscript);
-           }
-        };
-
-        recognitionRef.current.onerror = (event: any) => {
-          // Ignore errors if we have text captured already, we will try to use it in onend
-          console.error("Speech recognition error", event.error);
-          if (event.error === 'not-allowed') {
-             setStatus('idle');
-             setError("Microphone access denied. Use HTTPS.");
-          }
-        };
-
-        recognitionRef.current.onend = () => {
-           // GREEDY SRATEGY: If we have text in the ref, USE IT.
-           // Don't just go back to idle.
-           const collectedText = transcriptRef.current;
-           
-           setStatus(prev => {
-             // If already processing, do nothing
-             if (prev === 'processing' || prev === 'verifying' || prev === 'completed') return prev;
-             
-             // If we have text, PROCESS IT
-             if (collectedText && collectedText.trim().length > 0) {
-                 processCommand(collectedText);
-                 return 'processing'; // Switch state optimistically
-             }
-             
-             // Otherwise go idle
-             return 'idle';
-           });
-        };
-      } else {
-        setError("Your browser does not support voice recognition.");
-      }
+    if ('contacts' in navigator) {
+      setHasContactPermission(true);
+      console.log("✅ Contact Picker API is available");
+    } else {
+      console.log("⚠️ Contact Picker API not supported - will use fallback contacts");
     }
   }, []);
 
-  const speakVerification = (recipient: string, amount: string) => {
-    if ('speechSynthesis' in window) {
-      // "Pay 500 to Raju" - Simple English verification for clarity, or Hinglish if needed.
-      // Prompt says: "Safety Check: The button displays 'Pay ₹500 to Raju'. This gives the senior a moment to verify details."
-      // "verification of voice by read loudly"
-      const text = `Pay ${amount} rupees to ${recipient}`;
+  // Initialize Speech Recognition
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const { webkitSpeechRecognition, SpeechRecognition } = window as unknown as IWindow;
+    const Recognition = SpeechRecognition || webkitSpeechRecognition;
+
+    if (!Recognition) {
+      setError("Voice not supported in this browser");
+      return;
+    }
+
+    const recognition = new Recognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = 'en-IN'; // English-India for Roman script
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      console.log("🎤 RECORDING...");
+      setStatus('listening');
+      setError(null);
+    };
+
+    recognition.onresult = (event: any) => {
+      const text = event.results[0][0].transcript;
+      console.log("🎤 HEARD:", text);
+      setTranscript(text);
+      processCommand(text);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error("🎤 ERROR:", event.error);
+      setStatus('idle');
+      
+      if (event.error === 'not-allowed') {
+        setError("Microphone blocked. Please allow access.");
+      } else if (event.error === 'network') {
+        setError("Network error. Check internet connection.");
+      } else if (event.error !== 'no-speech') {
+        setError("Could not hear you. Try again.");
+      }
+    };
+
+    recognition.onend = () => {
+      console.log("🎤 STOPPED");
+    };
+
+    recognitionRef.current = recognition;
+  }, []);
+
+  // Load device contacts
+  const loadContacts = async () => {
+    if (!('contacts' in navigator)) {
+      alert("Contact access not supported on this browser. Using fallback contacts.");
+      return;
+    }
+
+    try {
+      const props = ['name', 'tel'];
+      // @ts-ignore - Contact Picker API
+      const selectedContacts = await navigator.contacts.select(props, { multiple: true });
+      
+      const formattedContacts: Contact[] = selectedContacts
+        .filter((c: any) => c.name && c.tel && c.tel.length > 0)
+        .map((c: any) => ({
+          name: c.name[0].toLowerCase(),
+          tel: c.tel[0]
+        }));
+      
+      setContacts(formattedContacts);
+      console.log("📇 Loaded contacts:", formattedContacts.length);
+      alert(`Loaded ${formattedContacts.length} contacts successfully!`);
+    } catch (err) {
+      console.error("Failed to load contacts:", err);
+      alert("Could not load contacts. Please try again or use fallback mode.");
+    }
+  };
+
+  // Process command
+  const processCommand = async (text: string) => {
+    console.log("\n⚙️ ═══════════════════════════");
+    console.log("⚙️ PROCESSING COMMAND");
+    console.log("⚙️ Text received:", text);
+    console.log("⚙️ Available contacts:", contacts.length);
+    console.log("⚙️ ═══════════════════════════\n");
+    setStatus('processing');
+
+    try {
+      // Send both text and contacts to backend
+      const res = await fetch('/api/process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          text,
+          contacts: contacts // Send user's contacts
+        }),
+      });
+
+      const data: Result = await res.json();
+      console.log("\n📦 ═══════════════════════════");
+      console.log("📦 API RESPONSE");
+      console.log("📦 Intent:", data.intent);
+      console.log("📦 Details:", data.details);
+      console.log("📦 Warning:", data.warning);
+      console.log("📦 ═══════════════════════════\n");
+      
+      setResult(data);
+
+      if (data.intent === 'scam') {
+        console.log("⚠️ SCAM PATH");
+        setStatus('scam');
+        speak(data.warning || "SCAM ALERT!");
+      } else if (data.intent === 'unknown') {
+        console.log("❓ UNKNOWN PATH");
+        setStatus('idle');
+        setError(data.warning || "I didn't understand");
+        speak(data.warning || "I didn't understand");
+      } else {
+        console.log("✅ VALID INTENT PATH - Going to VERIFYING");
+        setStatus('verifying');
+        
+        // Speak verification
+        if (data.intent === 'pay') {
+          const msg = `I am ready to pay ${data.details.amount} rupees to ${data.details.recipient}. Is this correct?`;
+          console.log("💰 PAYMENT verification:", msg);
+          speak(msg);
+        } else if (data.intent === 'call') {
+          const msg = `I am ready to call ${data.details.recipient}. Is this correct?`;
+          console.log("📞 CALL verification:", msg);
+          speak(msg);
+        }
+      }
+    } catch (err) {
+      console.error("💥 ERROR:", err);
+      setStatus('idle');
+      setError("Network error. Try again.");
+    }
+  };
+
+  // Text to Speech
+  const speak = (text: string) => {
+    console.log("🔊 SPEAKING:", text);
+    
+    if (!window.speechSynthesis) return;
+
+    window.speechSynthesis.cancel();
+    
+    setTimeout(() => {
       const utterance = new SpeechSynthesisUtterance(text);
-      // specific voice selection could be added here preferably Indian English
+      utterance.rate = 0.9;
+      utterance.lang = 'en-US';
+      
+      utterance.onstart = () => console.log("🔊 STARTED");
+      utterance.onend = () => console.log("🔊 ENDED");
+      utterance.onerror = () => console.log("🔊 FAILED (continuing...)");
+      
       window.speechSynthesis.speak(utterance);
+    }, 100);
+  };
+
+  // Actions
+  const startListening = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+      } catch (e) {
+        console.log("Restarting...");
+        recognitionRef.current.stop();
+        setTimeout(() => recognitionRef.current?.start(), 100);
+      }
     }
   };
 
   const handleConfirm = () => {
-    if (result?.upiLink) {
-      window.location.href = result.upiLink;
-      setStatus('completed');
+    if (!result) return;
+
+    if (result.intent === 'pay' && result.details.upiLink) {
+      window.location.href = result.details.upiLink;
+    } else if (result.intent === 'call' && result.details.number) {
+      window.location.href = `tel:${result.details.number}`;
     }
-  };
-
-  const handleReset = () => {
-    setStatus('idle');
-    setTranscript('');
-    setResult(null);
-    setError(null);
-  };
-
-  const handleEmergency = () => {
-    setStatus('processing');
     
-    const triggerSMS = (lat: number | null, long: number | null) => {
-        let message = "EMERGENCY! I need help.";
-        if (lat && long) {
-            const mapLink = `https://maps.google.com/?q=${lat},${long}`;
-            message += ` My current location: ${mapLink}`;
+    setStatus('completed');
+  };
+
+  const handleCancel = () => {
+    setStatus('idle');
+    setResult(null);
+    setTranscript('');
+    speak("Cancelled");
+  };
+
+  const handleSOS = () => {
+    const message = "EMERGENCY! I need help.";
+    
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const link = `https://maps.google.com/?q=${pos.coords.latitude},${pos.coords.longitude}`;
+          window.location.href = `https://wa.me/?text=${encodeURIComponent(message + " Location: " + link)}`;
+        },
+        () => {
+          window.location.href = `https://wa.me/?text=${encodeURIComponent(message)}`;
         }
-        
-        // Detect Mobile OS for SMS separator
-        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-        const separator = isIOS ? '&' : '?';
-        
-        // 1. Open Native SMS App (User MUST hit send due to browser security)
-        window.location.href = `sms:8866278406${separator}body=${encodeURIComponent(message)}`;
-        
-        // 2. Also log to backend for demo purposes
-        fetch('/api/emergency', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ lat, long }),
-        }).catch(e => console.error("Backend log failed", e));
-        
-        setStatus('idle');
-    };
-
-    if (!navigator.geolocation) {
-        triggerSMS(null, null);
-        return;
+      );
+    } else {
+      window.location.href = `https://wa.me/?text=${encodeURIComponent(message)}`;
     }
-
-    navigator.geolocation.getCurrentPosition(
-        (position) => {
-            triggerSMS(position.coords.latitude, position.coords.longitude);
-        },
-        (error) => {
-            console.error(error);
-            triggerSMS(null, null);
-        },
-        { enableHighAccuracy: true, timeout: 5000 }
-    );
   };
 
-  const handleCall = () => {
-      window.location.href = "tel:8866278406";
-  };
-
+  // Render
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center p-4 bg-slate-50 relative overflow-hidden">
-      {/* Background Decor */}
-      <div className="absolute top-0 left-0 w-full h-full overflow-hidden z-0 pointer-events-none opacity-50">
-        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-blue-200 rounded-full blur-[100px]" />
-        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-green-200 rounded-full blur-[100px]" />
-      </div>
+    <main className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex flex-col">
+      
+      {/* Header */}
+      <header className="bg-gradient-to-r from-blue-600 to-indigo-700 text-white p-6 shadow-lg">
+        <h1 className="text-4xl font-bold text-center">सहायक Sahayak</h1>
+        <p className="text-center text-blue-100 text-lg mt-1">आपका Voice Assistant</p>
+        
+        {/* Contact Load Button */}
+        <div className="flex justify-center mt-3">
+          <button
+            onClick={loadContacts}
+            className="bg-white/20 hover:bg-white/30 backdrop-blur-sm text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all"
+          >
+            <Users className="w-4 h-4" />
+            {contacts.length > 0 ? `${contacts.length} संपर्क loaded` : 'Load संपर्क / Contacts'}
+          </button>
+        </div>
+      </header>
 
-      <div className="z-10 w-full max-w-md bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-100 min-h-[600px] flex flex-col">
-        {/* Header */}
-        <header className="bg-blue-600 text-white p-6 text-center">
-          <h1 className="text-2xl font-bold tracking-wide">Sahayak <span className="font-light opacity-80">AI</span></h1>
-          <p className="text-blue-100 text-sm mt-1">Digital Inclusion for Everyone</p>
-        </header>
+      {/* Main Content */}
+      <div className="flex-1 flex items-center justify-center p-6">
+        <div className="w-full max-w-lg">
 
-        <div className="flex-1 flex flex-col items-center justify-center p-8 space-y-8 text-center">
-            
-            {/* IDLE STATE */}
-            {status === 'idle' && (
-                <>
-                  <div className="space-y-4">
-                    <h2 className="text-3xl font-bold text-slate-800">Who do you want to pay?</h2>
-                    <p className="text-slate-500 text-lg">Tap the button and say, <br/> <span className="italic text-slate-800">"Raju ko 500 rupaye bhejo"</span></p>
-                  </div>
-            
-                  <button 
-                    onClick={startListening}
-                    className="relative group transition-all duration-300 active:scale-95 touch-manipulation"
-                    aria-label="Start Listening"
+          {/* IDLE */}
+          {status === 'idle' && (
+            <div className="text-center space-y-8 animate-in fade-in duration-500">
+              <div>
+                <h2 className="text-3xl font-bold text-gray-800 mb-3">बटन दबाएं और बोलें</h2>
+                <p className="text-xl text-gray-600">"Raju ko 500 rupaye bhejo"</p>
+                <p className="text-xl text-gray-600">"Doctor ko call karo"</p>
+                {contacts.length > 0 && (
+                  <p className="text-sm text-green-600 mt-2">✓ {contacts.length} contacts ready</p>
+                )}
+              </div>
+
+              <button
+                onClick={startListening}
+                className="w-64 h-64 bg-gradient-to-br from-blue-500 to-blue-700 rounded-full shadow-2xl hover:shadow-blue-500/50 active:scale-95 transition-all mx-auto flex items-center justify-center"
+              >
+                <Mic className="w-32 h-32 text-white" />
+              </button>
+
+              {error && (
+                <div className="bg-red-100 border-2 border-red-300 text-red-800 p-4 rounded-xl text-lg font-medium">
+                  {error}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* LISTENING */}
+          {status === 'listening' && (
+            <div className="text-center space-y-8">
+              <h2 className="text-4xl font-bold text-blue-600 animate-pulse">सुन रहे हैं...</h2>
+              
+              <div className="relative">
+                <div className="absolute inset-0 bg-red-400 rounded-full animate-ping opacity-50" />
+                <div className="relative w-64 h-64 bg-red-500 rounded-full shadow-2xl mx-auto flex items-center justify-center">
+                  <Mic className="w-32 h-32 text-white" />
+                </div>
+              </div>
+
+              {transcript && (
+                <p className="text-xl text-gray-600 italic px-4">"{transcript}"</p>
+              )}
+            </div>
+          )}
+
+          {/* PROCESSING */}
+          {status === 'processing' && (
+            <div className="text-center space-y-6">
+              <Loader2 className="w-24 h-24 text-blue-600 animate-spin mx-auto" />
+              <h2 className="text-2xl font-semibold text-gray-700">समझ रहे हैं...</h2>
+              {transcript && <p className="text-lg text-gray-500 italic">"{transcript}"</p>}
+            </div>
+          )}
+
+          {/* VERIFYING */}
+          {status === 'verifying' && result && (
+            <div className="bg-white rounded-3xl shadow-2xl overflow-hidden animate-in slide-in-from-bottom duration-500">
+              <div className="bg-yellow-50 p-6 border-b-2 border-yellow-200">
+                <h2 className="text-2xl font-bold text-center text-yellow-800">कृपया Confirm करें</h2>
+              </div>
+
+              <div className="p-8 text-center space-y-6">
+                {result.intent === 'pay' && (
+                  <>
+                    <div className="text-7xl font-bold text-gray-900">₹{result.details.amount}</div>
+                    <div className="text-2xl text-gray-600">
+                      को <span className="font-bold text-black">{result.details.recipient}</span>
+                    </div>
+                  </>
+                )}
+
+                {result.intent === 'call' && (
+                  <>
+                    <Phone className="w-24 h-24 text-green-600 mx-auto" />
+                    <div className="text-3xl font-bold text-gray-900">{result.details.recipient} को Call करें?</div>
+                    <div className="text-xl text-gray-500">{result.details.number}</div>
+                  </>
+                )}
+
+                <div className="space-y-3 pt-4">
+                  <button
+                    onClick={handleConfirm}
+                    className="w-full bg-green-600 hover:bg-green-700 text-white text-2xl font-bold py-6 rounded-2xl shadow-xl active:scale-95 transition-all"
                   >
-                    <div className="absolute inset-0 bg-green-500 rounded-full opacity-20 group-hover:scale-110 transition-transform duration-500" />
-                    <div className="w-32 h-32 bg-green-600 rounded-full flex items-center justify-center shadow-lg shadow-green-200 group-hover:bg-green-500 transition-colors">
-                      <Mic className="w-12 h-12 text-white" />
-                    </div>
+                    ✓ हाँ, भेजें / Yes
                   </button>
-                  
-                  <div className="flex gap-4 mt-8 w-full px-8">
-                     <button
-                        onClick={handleEmergency}
-                        className="flex-1 bg-red-600 hover:bg-red-700 active:scale-95 text-white p-4 rounded-xl shadow-lg shadow-red-200 flex flex-col items-center gap-2 transition-all"
-                     >
-                        <AlertTriangle className="w-8 h-8" />
-                        <span className="font-bold">SOS Help</span>
-                     </button>
-                     
-                     <button
-                        onClick={handleCall}
-                        className="flex-1 bg-white border-2 border-green-500 text-green-600 active:scale-95 p-4 rounded-xl shadow-sm flex flex-col items-center gap-2 transition-all hover:bg-green-50"
-                     >
-                        <Phone className="w-8 h-8" />
-                        <span className="font-bold">Call</span>
-                     </button>
-                  </div>
-                  
-                  {error && <p className="text-red-500 font-medium animate-pulse mt-4">{error}</p>}
-                </>
-            )}
 
-            {/* LISTENING STATE */}
-            {status === 'listening' && (
-                <>
-                  <div className="space-y-4">
-                     <h2 className="text-2xl font-semibold text-blue-600 animate-pulse">Listening...</h2>
-                     {interimText && <p className="text-slate-500 font-medium px-4">"{interimText}"</p>}
-                  </div>
-                  
-                  <div className="relative">
-                    <div className="absolute inset-0 bg-red-500 rounded-full animate-pulse-ring opacity-50" />
-                    <div className="w-32 h-32 bg-red-500 rounded-full flex items-center justify-center shadow-xl animate-pulse">
-                      <Mic className="w-12 h-12 text-white" />
-                    </div>
-                  </div>
-                  
-                  <button onClick={stopListening} className="text-slate-400 text-sm underline z-20 p-2">
-                    Stop Listening
+                  <button
+                    onClick={handleCancel}
+                    className="w-full bg-white border-2 border-gray-300 text-gray-700 text-xl font-semibold py-4 rounded-2xl hover:bg-gray-50"
+                  >
+                    <X className="inline w-6 h-6 mr-2" />
+                    नहीं / Cancel
                   </button>
-                </>
-            )}
-
-            {/* PROCESSING STATE */}
-            {status === 'processing' && (
-                <div className="flex flex-col items-center space-y-6">
-                    <Loader2 className="w-16 h-16 text-blue-600 animate-spin" />
-                    <h2 className="text-xl font-medium text-slate-600">Processing your request...</h2>
-                    {transcript && <p className="text-slate-400 italic">"{transcript}"</p>}
                 </div>
-            )}
+              </div>
+            </div>
+          )}
 
-            {/* VERIFYING STATE */}
-            {status === 'verifying' && result && (
-                <div className="w-full space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
-                    <div className="bg-slate-50 p-6 rounded-2xl border border-slate-200 space-y-4">
-                        <div className="flex justify-center mb-2">
-                             <ShieldCheck className="w-10 h-10 text-green-600" />
-                        </div>
-                        <h2 className="text-xl font-semibold text-slate-700">Please Confirm</h2>
-                        <div className="space-y-1">
-                            <p className="text-4xl font-bold text-slate-900">₹{result.amount}</p>
-                            <p className="text-lg text-slate-500">to <span className="font-bold text-slate-800">{result.recipient}</span></p>
-                        </div>
-                    </div>
+          {/* SCAM ALERT */}
+          {status === 'scam' && result && (
+            <div className="bg-red-50 border-4 border-red-600 rounded-3xl p-8 text-center space-y-6 animate-in shake">
+              <AlertTriangle className="w-32 h-32 text-red-600 mx-auto" />
+              <h2 className="text-4xl font-bold text-red-800">⚠️ खतरा! SCAM!</h2>
+              <p className="text-2xl text-red-700 font-medium leading-relaxed">
+                {result.warning}
+              </p>
+              <button
+                onClick={handleCancel}
+                className="w-full bg-red-600 text-white text-xl font-bold py-4 rounded-xl shadow-lg"
+              >
+                समझ गया / I Understand
+              </button>
+            </div>
+          )}
 
-                    <div className="space-y-3 w-full">
-                        <button 
-                          onClick={handleConfirm}
-                          className="w-full bg-blue-600 hover:bg-blue-700 text-white text-xl font-bold py-5 rounded-2xl shadow-xl shadow-blue-200 active:scale-95 transition-all flex items-center justify-center gap-3"
-                        >
-                          <span>Confirm & Pay </span>
-                          <ArrowRight className="w-6 h-6" />
-                        </button>
-
-                        <button 
-                           onClick={handleReset}
-                           className="w-full bg-white border-2 border-slate-200 text-slate-500 font-semibold py-4 rounded-2xl hover:bg-slate-50 transition-colors"
-                        >
-                           Cancel
-                        </button>
-                    </div>
-                </div>
-            )}
-            
-            {/* COMPLETED/ACTION STATE */}
-            {status === 'completed' && (
-                 <div className="text-center space-y-4">
-                    <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto">
-                        <Check className="w-10 h-10 text-green-600" />
-                    </div>
-                    <h2 className="text-2xl font-bold text-slate-800">Opening Payment App...</h2>
-                    <button onClick={handleReset} className="flex items-center justify-center gap-2 text-blue-600 font-medium mx-auto mt-8">
-                        <RefreshCcw className="w-4 h-4" /> Start Over
-                    </button>
-                 </div>
-            )}
+          {/* COMPLETED */}
+          {status === 'completed' && (
+            <div className="text-center space-y-6">
+              <div className="w-32 h-32 bg-green-100 rounded-full flex items-center justify-center mx-auto">
+                <Check className="w-16 h-16 text-green-600" />
+              </div>
+              <h2 className="text-3xl font-bold text-gray-800">App खोल रहे हैं...</h2>
+              <button
+                onClick={handleCancel}
+                className="text-blue-600 text-xl font-medium underline"
+              >
+                फिर से शुरू करें / Start Over
+              </button>
+            </div>
+          )}
 
         </div>
-        
-        <footer className="p-4 border-t border-slate-100 text-center text-slate-400 text-xs">
-             Sahayak AI Hackathon Demo
-        </footer>
       </div>
+
+      {/* SOS Footer */}
+      <footer className="p-4 bg-white border-t-2 border-gray-200 shadow-lg">
+        <button
+          onClick={handleSOS}
+          className="w-full bg-red-600 hover:bg-red-700 text-white font-bold text-2xl py-5 rounded-xl shadow-lg flex items-center justify-center gap-3 active:scale-95 transition-transform"
+        >
+          <AlertTriangle className="w-8 h-8" />
+          SOS EMERGENCY
+        </button>
+      </footer>
+
     </main>
   );
 }
