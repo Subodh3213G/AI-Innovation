@@ -46,8 +46,19 @@ export default function Home() {
   const [transcript, setTranscript] = useState('');
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [hasContactPermission, setHasContactPermission] = useState(false);
+  const [emergencyContact, setEmergencyContact] = useState<string>('');
+  const [showEmergencySetup, setShowEmergencySetup] = useState(false);
+  const [tempEmergencyNumber, setTempEmergencyNumber] = useState('');
   
   const recognitionRef = useRef<any>(null);
+
+  // Load emergency contact from localStorage on mount
+  useEffect(() => {
+    const saved = localStorage.getItem('sahayak_emergency_contact');
+    if (saved) {
+      setEmergencyContact(saved);
+    }
+  }, []);
 
   // Check if Contact Picker API is supported
   useEffect(() => {
@@ -276,26 +287,79 @@ export default function Home() {
     speak("Cancelled");
   };
 
+  // Save emergency contact
+  const saveEmergencyContact = () => {
+    if (!tempEmergencyNumber || tempEmergencyNumber.length < 10) {
+      alert('कृपया सही नंबर डालें / Please enter a valid number');
+      return;
+    }
+    
+    // Add country code if not present
+    let formattedNumber = tempEmergencyNumber.replace(/\D/g, ''); // Remove non-digits
+    if (!formattedNumber.startsWith('91')) {
+      formattedNumber = '91' + formattedNumber;
+    }
+    
+    localStorage.setItem('sahayak_emergency_contact', formattedNumber);
+    setEmergencyContact(formattedNumber);
+    setShowEmergencySetup(false);
+    setTempEmergencyNumber('');
+    alert(`✅ Emergency contact saved: +${formattedNumber}`);
+  };
+
   const handleSOS = () => {
-    const emergencyContact = "919693304474"; // Emergency WhatsApp number with country code
+    // Check if emergency contact is set
+    if (!emergencyContact) {
+      setShowEmergencySetup(true);
+      alert('कृपया पहले Emergency Contact जोड़ें / Please set emergency contact first');
+      return;
+    }
+
     const message = "🚨 EMERGENCY! I need help immediately!";
     
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (pos) => {
-          const link = `https://maps.google.com/?q=${pos.coords.latitude},${pos.coords.longitude}`;
-          const fullMessage = `${message}\n\n📍 My Location: ${link}`;
-          window.location.href = `https://wa.me/${emergencyContact}?text=${encodeURIComponent(fullMessage)}`;
+          const lat = pos.coords.latitude;
+          const lon = pos.coords.longitude;
+          const mapsLink = `https://maps.google.com/?q=${lat},${lon}`;
+          const fullMessage = `${message}\n\n📍 My Location:\n${mapsLink}`;
+          
+          // Open BOTH WhatsApp and SMS
+          // WhatsApp
+          window.open(`https://wa.me/${emergencyContact}?text=${encodeURIComponent(fullMessage)}`, '_blank');
+          
+          // SMS (opens after a short delay)
+          setTimeout(() => {
+            window.open(`sms:+${emergencyContact}?body=${encodeURIComponent(fullMessage)}`, '_blank');
+          }, 500);
+          
+          alert(`✅ Emergency alert sent to +${emergencyContact}\nvia WhatsApp and SMS`);
         },
         () => {
           // If location access denied, send message without location
-          window.location.href = `https://wa.me/${emergencyContact}?text=${encodeURIComponent(message + "\n\n⚠️ Could not get location.")}`;
+          const fallbackMessage = `${message}\n\n⚠️ Could not get location.`;
+          
+          // Send via both WhatsApp and SMS
+          window.open(`https://wa.me/${emergencyContact}?text=${encodeURIComponent(fallbackMessage)}`, '_blank');
+          setTimeout(() => {
+            window.open(`sms:+${emergencyContact}?body=${encodeURIComponent(fallbackMessage)}`, '_blank');
+          }, 500);
+          
+          alert(`⚠️ Location unavailable.\nEmergency alert sent to +${emergencyContact}`);
         },
         { timeout: 5000 } // 5 second timeout for getting location
       );
     } else {
       // If geolocation not supported
-      window.location.href = `https://wa.me/${emergencyContact}?text=${encodeURIComponent(message)}`;
+      const fallbackMessage = message;
+      
+      window.open(`https://wa.me/${emergencyContact}?text=${encodeURIComponent(fallbackMessage)}`, '_blank');
+      setTimeout(() => {
+        window.open(`sms:+${emergencyContact}?body=${encodeURIComponent(fallbackMessage)}`, '_blank');
+      }, 500);
+      
+      alert(`Emergency alert sent to +${emergencyContact}`);
     }
   };
 
@@ -308,14 +372,22 @@ export default function Home() {
         <h1 className="text-4xl font-bold text-center">सहायक Sahayak</h1>
         <p className="text-center text-blue-100 text-lg mt-1">आपका Voice Assistant</p>
         
-        {/* Contact Load Button */}
-        <div className="flex justify-center mt-3">
+        {/* Contact Load Button and Emergency Contact */}
+        <div className="flex justify-center gap-3 mt-3 flex-wrap">
           <button
             onClick={loadContacts}
             className="bg-white/20 hover:bg-white/30 backdrop-blur-sm text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all"
           >
             <Users className="w-4 h-4" />
             {contacts.length > 0 ? `${contacts.length} संपर्क loaded` : 'Load संपर्क / Contacts'}
+          </button>
+          
+          <button
+            onClick={() => setShowEmergencySetup(true)}
+            className={`${emergencyContact ? 'bg-green-500/30' : 'bg-red-500/30'} hover:bg-white/30 backdrop-blur-sm text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-all`}
+          >
+            <AlertTriangle className="w-4 h-4" />
+            {emergencyContact ? `SOS: +${emergencyContact}` : 'Set SOS Contact'}
           </button>
         </div>
       </header>
@@ -470,6 +542,78 @@ export default function Home() {
 
         </div>
       </div>
+
+      {/* Emergency Contact Setup Modal */}
+      {showEmergencySetup && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-md w-full p-8 animate-in slide-in-from-bottom duration-300">
+            <div className="text-center mb-6">
+              <AlertTriangle className="w-16 h-16 text-red-600 mx-auto mb-3" />
+              <h2 className="text-3xl font-bold text-gray-900 mb-2">SOS Emergency Contact</h2>
+              <p className="text-gray-600">
+                {emergencyContact 
+                  ? 'बदलें या Update करें / Change or Update' 
+                  : 'कृपया Emergency Number जोड़ें / Please add emergency number'}
+              </p>
+            </div>
+
+            <div className="space-y-4">
+              {emergencyContact && (
+                <div className="bg-green-50 border-2 border-green-200 rounded-xl p-4">
+                  <p className="text-sm text-green-700 mb-1">Current Contact:</p>
+                  <p className="text-xl font-bold text-green-900">+{emergencyContact}</p>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-gray-700 font-medium mb-2">
+                  Emergency Contact Number
+                </label>
+                <input
+                  type="tel"
+                  value={tempEmergencyNumber}
+                  onChange={(e) => setTempEmergencyNumber(e.target.value)}
+                  placeholder="9693304474"
+                  className="w-full px-4 py-4 text-2xl border-2 border-gray-300 rounded-xl focus:border-blue-500 focus:outline-none text-center font-mono"
+                  maxLength={12}
+                />
+                <p className="text-sm text-gray-500 mt-2 text-center">
+                  10-digit mobile number (country code will be added)
+                </p>
+              </div>
+
+              <div className="space-y-3 pt-2">
+                <button
+                  onClick={saveEmergencyContact}
+                  className="w-full bg-green-600 hover:bg-green-700 text-white text-xl font-bold py-4 rounded-2xl shadow-xl active:scale-95 transition-all"
+                >
+                  ✓ Save Contact
+                </button>
+
+                <button
+                  onClick={() => {
+                    setShowEmergencySetup(false);
+                    setTempEmergencyNumber('');
+                  }}
+                  className="w-full bg-white border-2 border-gray-300 text-gray-700 text-lg font-semibold py-3 rounded-2xl hover:bg-gray-50"
+                >
+                  <X className="inline w-5 h-5 mr-2" />
+                  Cancel
+                </button>
+              </div>
+
+              <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mt-4">
+                <p className="text-sm text-blue-900">
+                  <strong>📱 SOS sends:</strong>
+                  <br />• WhatsApp message with location
+                  <br />• SMS with location
+                  <br />• Both sent simultaneously
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* SOS Footer */}
       <footer className="p-4 bg-white border-t-2 border-gray-200 shadow-lg">
